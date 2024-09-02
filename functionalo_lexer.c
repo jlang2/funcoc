@@ -1,0 +1,1105 @@
+#include <stdio.h>
+#include <ctype.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdbool.h>
+#include <bsd/string.h>
+
+static char *IdentifierStr = NULL;
+static int NumVal;
+static int LastChar = ' ';
+static FILE *fptr = NULL;
+static char *AnonExpr = "__anon_expr";
+static int Depth = 0;
+
+enum Token {
+    tok_eof = -1,
+    tok_fn = -2,
+    tok_identifier = -3,
+    tok_expose = -4,
+    tok_reserve = -5,
+    tok_hide = -6,
+    tok_int = -7,
+    tok_equals = -8,
+    tok_declaration = -9,
+    tok_assignment = -10,
+    tok_binop = -11
+};
+
+typedef struct VarRefKeyValue
+{
+    char *Key;
+    char *Val;
+} VarRefKeyValue;
+
+typedef struct VarRefMap
+{
+    struct VarRefKeyValue *map;
+    size_t size;
+} VarRefMap;
+
+static struct VarRefMap varMap = { .map = NULL, .size = 0 };
+
+static char *VarRefMap_getValue(struct VarRefMap map, char *key)
+{
+    for (int i = 0; i < map.size; i++)
+    {
+        struct VarRefKeyValue chk = map.map[i];
+        if (strcmp(chk.Key, key) == 0)
+        {
+            return chk.Val;
+        }
+    }
+
+    return NULL;
+}
+
+static char* appendStringAlloc(char *str, char character) {
+    char *newString, *ptr;
+
+    size_t length;
+
+    if (str == NULL)
+    {
+        length = 2;
+    } else
+    {
+        length = strlen(str) + 2;
+    }
+
+    if ((newString = calloc(length, sizeof(char))) == NULL)
+    {
+        printf("Error allocating memory.\n");
+        exit(-1);
+    }
+
+    ptr = newString;
+
+    if (str != NULL)
+    {
+        for (char c = *str; c != '\0'; c = *++str)
+        {
+            *ptr = c;
+            ptr++;
+        }
+    }
+
+    *ptr = character;
+
+    return newString;
+}
+
+static int gettok(FILE *fptr) {
+
+    if (fptr == NULL)
+    {
+        printf("null file pointer");
+        exit(-1);
+    }
+
+    while (isspace(LastChar)) {
+        LastChar = getc(fptr);
+    }
+
+    if (LastChar == '=')
+    {
+        LastChar = getc(fptr);
+        if (LastChar == '=')
+        {
+            LastChar = getc(fptr);
+            return tok_equals;
+        }
+        return tok_assignment;
+    }
+
+    if (isalpha(LastChar)) {
+        char *newString = calloc(2, sizeof(char));
+        if (newString == NULL) {
+            exit(-1);
+        }
+        newString[0] = LastChar;
+
+        LastChar = getc(fptr);
+        while (isalnum(LastChar)) {
+            char *appendedStr = appendStringAlloc(newString, LastChar);
+            free(newString);
+            newString = appendedStr;
+            LastChar = getc(fptr);
+        }
+
+        IdentifierStr = newString;
+
+        if (LastChar == ':') {
+            LastChar = getc(fptr); // eat :
+            return tok_declaration;
+        }
+
+        if (strcmp(IdentifierStr, "fn") == 0) {
+            free(IdentifierStr);
+            return tok_fn;
+        }
+
+        if (strcmp(IdentifierStr, "expose") == 0) {
+            free(IdentifierStr);
+            return tok_expose;
+        }
+
+        return tok_identifier;
+    }
+
+    if (isdigit(LastChar)) {
+        char *numString = calloc(2, sizeof(char));
+
+        do {
+            char *newString = appendStringAlloc(numString, LastChar);
+            free(numString);
+            numString = newString;
+            LastChar = getc(fptr);
+        } while (isdigit(LastChar) );
+
+        NumVal = atoi(numString);
+        free(numString);
+        return tok_int;
+    }
+
+    if (LastChar == EOF) {
+        return tok_eof;
+    }
+
+    int thisChar = LastChar;
+    LastChar = getc(fptr);
+
+    return thisChar;
+}
+
+typedef struct exp_body { struct Exp **exprs; int numExprs; } exp_body;
+typedef struct Exp Exp;
+struct Exp
+{
+    enum EXP {
+        exp_int,
+        exp_var,
+        exp_add,
+        exp_call,
+        exp_prototype,
+        exp_function,
+        exp_assignment,
+        exp_declaration
+    } tag;
+    union {
+        struct exp_int { int val; } exp_int;
+        struct exp_var { char *name; } exp_var;
+        struct exp_add { struct Exp *left; struct Exp *right; } exp_add;
+        struct exp_call { char *callee; Exp** args; int numArgs; } exp_call;
+        struct exp_prototype { char *name; char **args; int numArgs; } exp_prototype;
+        struct exp_function { struct exp_prototype *proto; struct exp_body *body; } exp_function;
+        struct exp_assignment { struct Exp *target; struct Exp *right; } exp_assignment;
+        struct exp_declaration { char *type; char *name; } exp_declaration;
+    };
+};
+
+Exp *Exp_new(Exp exp)
+{
+    Exp *ptr = malloc(sizeof(Exp));
+    if (ptr) *ptr = exp;
+    return ptr;
+}
+
+void Exp_printPrototype(struct exp_prototype *proto)
+{
+    if (proto == NULL)
+        return;
+
+    struct exp_prototype protostruct = *proto;
+    char *protoName = protostruct.name;
+    printf("%s(", protoName);
+    int numArgs = proto->numArgs;
+    for (int i = 0; i < numArgs; i++)
+    {
+        printf("%s", proto->args[i]);
+    }
+    printf(")");
+}
+
+void FreeProto(struct exp_prototype *proto)
+{
+    if (proto == NULL)
+        return;
+
+    if (proto->args != NULL)
+    {
+        int numArgs = proto->numArgs;
+        for (int i = 0; i < numArgs; i++)
+        {
+            free(proto->args[i]);
+        }
+        free(proto->args);
+    }
+    free(proto->name);
+    free(proto);
+    return;
+}
+
+void Exp_Free(struct Exp *exp)
+{
+    if (!exp)
+    {
+        return;
+    }
+
+    if(exp == NULL)
+    {
+        return;
+    }
+
+    if (exp->tag == exp_function)
+    {
+        struct exp_prototype *proto = exp->exp_function.proto;
+        FreeProto(proto);
+        exp_body *body = exp->exp_function.body;
+        for (int i = 0; i < body->numExprs; i++)
+        {
+            Exp_Free(body->exprs[i]);
+        }
+        free(body->exprs);
+        free(body);
+        free(exp);
+        return;
+    }
+    
+    if (exp->tag == exp_prototype)
+    {
+        struct exp_prototype proto = exp->exp_prototype;
+        free(proto.args);
+        free(proto.name);
+        free(exp);
+        return;
+    }
+
+    if (exp->tag == exp_declaration)
+    {
+        free(exp->exp_declaration.name);
+        free(exp->exp_declaration.type);
+        free(exp);
+        return;
+    }
+
+    if (exp->tag == exp_assignment)
+    {
+        Exp_Free(exp->exp_assignment.target);
+        Exp_Free(exp->exp_assignment.right);
+        free(exp);
+        return;
+    }
+
+    if (exp->tag == exp_int)
+    {
+        free(exp);
+        return;
+    }
+
+    if (exp->tag == exp_var)
+    {
+        free(exp->exp_var.name);
+        free(exp);
+        return;
+    }
+
+    if (exp->tag == exp_add)
+    {
+        Exp_Free(exp->exp_add.left);
+        Exp_Free(exp->exp_add.right);
+        free(exp);
+        return;
+    }
+
+    if (exp->tag == exp_call)
+    {
+        free(exp->exp_call.callee);
+        int numArgs = exp->exp_call.numArgs;
+        for (int i = 0; i < numArgs; i++)
+        {
+            Exp_Free(exp->exp_call.args[i]);
+        }
+        free(exp->exp_call.args);
+        free(exp);
+        return;
+    }
+}
+
+char *concat(char *s1, char *s2)
+{
+    char *res = malloc(strlen(s1) + strlen(s2) + 1);
+    strlcpy(res, s1, strlen(res) + 1);
+    strlcat(res, s2, strlen(res) + strlen(s2) + 1);
+    return res;
+}
+
+char *getPadding(int depth)
+{
+    char *padding = malloc(1);
+    padding[0] = '\0';
+    return padding;
+}
+
+char * Exp_prepare(Exp *exp, int depth)
+{
+    char *padding = getPadding(depth);
+    if (exp->tag == exp_call)
+    {
+        struct exp_call call = exp->exp_call;
+        if (strcmp(call.callee, "toString") == 0)
+        {
+            char *varName = call.args[0]->exp_var.name;
+            printf("%s%%%s =w add %%%s, 48\n", padding, varName, varName);
+
+
+            size_t len = strlen(varName);
+            char *finalVar = malloc(sizeof(char) * len + 1);
+            strlcpy(finalVar, varName, len + 1);
+
+            return finalVar;
+        }
+    }
+    return NULL;
+}
+
+void setupGlobals()
+{
+    // empty character buffer for printing to stdout
+    printf("data $ch = { b 0 }\n");
+}
+
+void Exp_toIL(Exp *exp, int depth)
+{
+    if (exp->tag == exp_function)
+    {
+        char *funcName = exp->exp_function.proto->name;
+
+        if (strcmp(funcName, "entry") == 0)
+        {
+            printf("export function w $main() {\n");
+        } else {
+            printf("function $%s() {\n", funcName);
+        }
+
+        printf("@start\n");
+
+        exp_body *body = exp->exp_function.body;
+
+        int numExprs = body->numExprs;
+
+        for (int i = 0; i < numExprs; i++)
+        {
+            Exp_toIL(body->exprs[i], 1);
+        }
+        printf("    ret 0");
+        printf("}\n");
+    }
+
+    if (exp->tag == exp_assignment)
+    {
+        struct exp_assignment asign = exp->exp_assignment;
+        struct exp_declaration decl = asign.target->exp_declaration;
+
+        char *padding = getPadding(depth);
+
+        char *exprs = concat("%", decl.name);
+        char *temp = concat(exprs, " =w \0");
+        free(exprs);
+        exprs = temp;
+        printf("%s%s", padding, exprs);
+        free(padding);
+        free(exprs);
+        Exp_toIL(asign.right, depth);
+    }
+
+    if (exp->tag == exp_call)
+    {
+        struct exp_call call = exp->exp_call;
+        if (strcmp(call.callee, "print") == 0)
+        {
+            char **vars = malloc(sizeof(char *) * 1);
+            size_t allocated = 1;
+            size_t size = 0;
+            for (int i = 0; i < call.numArgs; i++)
+            {
+                char * finalVar = Exp_prepare(call.args[i], depth);
+                if (allocated < size + 1)
+                {
+                    char **temp = realloc(vars, allocated + 1);
+                    if (temp == NULL)
+                    {
+                        printf("error allocating memory");
+                        exit(-1);
+                    }
+                    allocated++;
+                    vars = temp;
+                }
+                vars[size++] = finalVar;
+            }
+
+            bool first = true;
+            for (int i = 0; i < size; i++)
+            {
+                if (first)
+                {
+                    first = false;
+                    printf("storew %%%s, $ch\n", vars[i]);
+                } else {
+                    printf(", %s", vars[i]);
+                }
+                free(vars[i]);
+            }
+            free(vars);
+            printf("call $puts(l $ch)\n");
+        }
+    }
+
+    if (exp->tag == exp_var)
+    {
+        char *vartype = VarRefMap_getValue(varMap, exp->exp_var.name);
+        if (strcmp(vartype, "int") == 0)
+        {
+            printf("w %%%s", exp->exp_var.name);
+        } else
+        {
+            printf("<unknown IL type> %s", exp->exp_var.name);
+        }
+    }
+
+    if (exp->tag == exp_add)
+    {
+        // assume add expression is int expression;
+        int val1 = exp->exp_add.left->exp_int.val;
+        int val2 = exp->exp_add.right->exp_int.val;
+        printf("add %d, %d\n", val1, val2);
+    }
+}
+
+void Exp_print(Exp *exp)
+{
+    if (!exp)
+    {
+        return;
+    }
+
+    if(exp == NULL)
+    {
+        return;
+    }
+
+    if (exp->tag == exp_function)
+    {
+        struct exp_prototype proto = *exp->exp_function.proto;
+        Exp_printPrototype(&proto);
+        printf(" {\n");
+        exp_body *body = exp->exp_function.body;
+        for (int i = 0; i < body->numExprs; i++)
+        {
+            printf("    ");
+            Exp_print(body->exprs[i]);
+            printf(";\n");
+        }
+        printf("}\n");
+        return;
+    }
+    
+    if (exp->tag == exp_prototype)
+    {
+        struct exp_prototype proto = exp->exp_prototype;
+        Exp_printPrototype(&proto);
+        return;
+    }
+
+    if (exp->tag == exp_declaration)
+    {
+        printf("%s: ", exp->exp_declaration.name);
+        printf("%s", exp->exp_declaration.type);
+        return;
+    }
+
+    if (exp->tag == exp_assignment)
+    {
+        Exp_print(exp->exp_assignment.target);
+        printf("=");
+        Exp_print(exp->exp_assignment.right);
+        return;
+    }
+
+    if (exp->tag == exp_int)
+    {
+        printf("%d", exp->exp_int.val);
+        return;
+    }
+
+    if (exp->tag == exp_var)
+    {
+        printf("%s", exp->exp_var.name);
+        return;
+    }
+
+    if (exp->tag == exp_add)
+    {
+        Exp_print(exp->exp_add.left);
+        printf("+");
+        Exp_print(exp->exp_add.right);
+        return;
+    }
+
+    if (exp->tag == exp_call)
+    {
+        printf("%s(", exp->exp_call.callee);
+        int numArgs = exp->exp_call.numArgs;
+        Exp **args = exp->exp_call.args;
+        bool first = true;
+        for (int i = 0; i < numArgs; i++)
+        {
+            if (first)
+            {
+                first = false;
+                Exp_print(args[i]);
+                continue;
+            }
+            printf(",");
+            Exp_print(args[i]);
+        }
+        printf(")");
+        return;
+    }
+}
+
+static int CurTok;
+
+static int getNextToken()
+{
+    return CurTok = gettok(fptr);
+}
+
+#define EXP_NEW(tag, ...) \
+    Exp_new((Exp){tag, {.tag=(struct tag){__VA_ARGS__}}})
+
+typedef struct TokPrecedenceArray
+{
+    struct TokPrecedenceMap *map;
+    size_t size;
+} TokPrecedenceArray;
+
+typedef struct TokPrecedenceMap
+{
+    char Key;
+    int Val;
+} TokPrecedenceMap;
+
+static struct TokPrecedenceArray BinopPrecedenceArr =
+{
+    .size = 4,
+    .map = (struct TokPrecedenceMap[])
+    {
+        [0] = { .Key = '<', .Val = 10 },
+        [1] = { .Key = '+', .Val = 20 },
+        [2] = { .Key = '-', .Val = 20 },
+        [3] = { .Key = '*', .Val = 40 }
+    }
+};
+
+static int getValue(struct TokPrecedenceArray arr, char key)
+{
+    for (int i = 0; i < arr.size; i++)
+    {
+        struct TokPrecedenceMap chk = arr.map[i];
+        if (chk.Key == key)
+        {
+            return chk.Val;
+        }
+    }
+
+    return -1;
+}
+
+static int GetTokPrecedence()
+{
+    if (CurTok > 127) // is not ascii
+    {
+        return -1;
+    }
+
+    int TokPrec = getValue(BinopPrecedenceArr, CurTok);
+    if (TokPrec <= 0) return -1;
+    return TokPrec;
+}
+
+static Exp *ParsePrimary();
+
+static Exp *ParseBinOpRHS(int exprPrec, Exp *lhs)
+{
+    while (1)
+    {
+        int TokPrec = GetTokPrecedence();
+        if (TokPrec < exprPrec)
+        {
+            return lhs;
+        }
+
+        int BinOp = CurTok;
+        if (BinOp != '+')
+        {
+            printf("not implemented");
+            free(lhs);
+            exit(-1);
+        }
+
+        getNextToken(); // eat binop
+
+        Exp *rhs = ParsePrimary();
+
+        if (rhs == NULL)
+        {
+            free(lhs);
+            return NULL;
+        }
+
+        int nextPrec = GetTokPrecedence();
+        if (TokPrec < nextPrec)
+        {
+            Exp *temp = ParseBinOpRHS(TokPrec + 1, rhs);
+            if (temp == NULL)
+            {
+                return NULL;
+            }
+            rhs = temp;
+        }
+
+        Exp *addExpr = EXP_NEW(exp_add, lhs, rhs);
+
+        return addExpr;
+    }
+}
+
+static Exp *ParseIntExpr()
+{
+    Exp *exp = EXP_NEW(exp_int, NumVal);
+    getNextToken();
+    return exp;
+}
+
+
+static Exp *ParseExpression()
+{
+    Exp *lhs = ParsePrimary();
+    if (!lhs)
+    {
+        return NULL;
+    }
+
+    Exp* exp = ParseBinOpRHS(0, lhs);
+    return exp;
+}
+
+static Exp *ParseDeclaration()
+{
+    char *varName = IdentifierStr;
+
+    getNextToken(); // eat type
+
+    char *type = IdentifierStr;
+
+    struct VarRefKeyValue *temp = calloc(1, sizeof(struct VarRefKeyValue));
+    if (temp == NULL)
+    {
+        printf("error allocating memory");
+        exit(-1);
+    }
+
+    varMap.map = temp;
+    varMap.map[0] = (struct VarRefKeyValue) { .Key = varName, .Val = type };
+    varMap.size++;
+
+    printf("%s :%s\n", varMap.map[0].Key, varMap.map[0].Val);
+
+    getNextToken(); // eat '='
+    Exp *lhs = EXP_NEW(exp_declaration, type, varName);
+
+    getNextToken(); // advance to expression
+    Exp *body = ParseExpression();
+
+    if (body == NULL)
+    {
+        free(lhs);
+        exit(-1);
+    }
+
+    Exp *expr = EXP_NEW(exp_assignment, lhs, body);
+
+    if (CurTok != ';')
+    {
+        printf("expected ; after variable declaration");
+        exit(-1);
+    }
+
+    return expr;
+}
+
+static Exp *ParseParenExpr()
+{
+    getNextToken(); // eat (
+    Exp *exp = ParseExpression();
+    if (!exp)
+        return NULL;
+
+    if (CurTok != ')')
+    {
+        printf("expected ')'");
+        exit(-1);
+    }
+    getNextToken();
+    return exp;
+}
+
+static struct exp_prototype *ParsePrototype()
+{
+    if (CurTok != tok_identifier)
+    {
+        printf("Expected function name");
+        exit(-1);
+    }
+
+    char *fnName = IdentifierStr;
+    getNextToken();
+
+    char **argNames = calloc(1, sizeof(char *));
+    int allocated = 1;
+    int idx = 0;
+    while((getNextToken() == tok_identifier))
+    {
+        if (!(idx < allocated))
+        {
+            char **temp = realloc(argNames, allocated + 1);
+            if (temp == NULL)
+            {
+                printf("error allocating memory.");
+                exit(-1);
+            }
+            allocated++;
+            argNames = temp;
+        }
+
+        argNames[idx] = IdentifierStr;
+        idx++;
+    }
+
+    if (CurTok != ')')
+    {
+        printf("expected ')' at end of function call");
+        exit(-1);
+    }
+
+    getNextToken(); // eat ')'
+    getNextToken(); // eat {
+
+    struct exp_prototype *expr = malloc(sizeof(struct exp_prototype));
+    if (expr == NULL)
+    {
+        free(argNames);
+        return NULL;
+    }
+    expr->name = fnName;
+    expr->args = argNames;
+    expr->numArgs = idx;
+    
+    return expr;
+}
+
+
+void expect(char expect)
+{
+    getNextToken();
+    if (CurTok != expect)
+    {
+        printf("expected: %c got: %c", expect, CurTok);
+        exit(-1);
+    }
+}
+
+static Exp *ParseDefinition()
+{
+    getNextToken(); // eat fn.
+    struct exp_prototype *proto = ParsePrototype();
+
+    if (proto == NULL)
+    {
+        return NULL;
+    }
+
+    Exp **exprs = malloc(sizeof(struct Exp *));
+    size_t allocated = 1;
+    size_t size = 0;
+    while (CurTok != '}')
+    {
+        Exp *e = ParseExpression();
+        if (e == NULL)
+            continue;
+
+        if (size + 1 > allocated) {
+            Exp **temp = realloc(exprs, (size + 1) * sizeof(struct Exp *));
+            if (temp == NULL)
+            {
+                printf("error allocating memory.");
+                free(exprs);
+                exit(-1);
+            }
+            exprs = temp;
+            allocated++;
+        }
+        exprs[size++] = e;
+    }
+
+    exp_body *body = malloc(sizeof(struct exp_body));
+    if (body == NULL)
+    {
+        printf("error allocating memory");
+        for (int i = 0; i < size; i++)
+        {
+            Exp_Free(exprs[i]);
+        }
+        free(exprs);
+        free(proto);
+        exit(-1);
+    }
+    body->exprs = exprs;
+    body->numExprs = size;
+    struct Exp *expr = EXP_NEW(exp_function, proto, body);
+    return expr;
+
+    return NULL;
+}
+
+static Exp *ParseIdentifierExpr()
+{
+    char *IdName = IdentifierStr;
+    getNextToken();
+
+    if (CurTok != '(') // simple variable ref
+    {
+        return EXP_NEW(exp_var, IdName);
+    }
+
+    getNextToken();
+
+    Exp **args = malloc(sizeof(Exp *));
+    size_t length = 0;
+    size_t allocated = 1;
+    if (CurTok != ')')
+    {
+        while (1)
+        {
+            Exp *arg = ParseExpression();
+            if (arg != NULL)
+            {
+                if (allocated < length + 1)
+                {
+                    Exp **temp = realloc(args, (length + 1) * sizeof(Exp *));
+                    if (temp == NULL)
+                    {
+                        printf("error allocating memory.");
+                        free(args);
+                        exit(-1);
+                    }
+                    args = temp;
+                }
+                args[length++] = arg;
+                allocated++;
+            }
+            else
+            {
+                free(args);
+                return NULL;
+            }
+
+            if (CurTok == ')')
+            {
+                break;
+            }
+
+            if (CurTok != ',')
+            {
+                printf("Expected ')' or ',' in argument list");
+                exit(-1);
+            }
+
+            getNextToken();
+        }
+    }
+	getNextToken(); // eat ')'
+
+	Exp *exp = EXP_NEW(exp_call, IdName, args, length);
+
+    return exp;
+}
+
+static Exp *ParsePrimary()
+{
+    switch (CurTok)
+    {
+        case '(':
+            printf("parsed '('\n");
+            return ParseParenExpr();
+
+        case ';':
+            printf("end of expression\n");
+            getNextToken();
+            return NULL;
+
+        case tok_int:
+            printf("Parsed int expr\n");
+            return ParseIntExpr();
+
+        case tok_identifier:
+            printf("Parsed identifier expr\n");
+            return ParseIdentifierExpr();
+
+        case tok_declaration:
+            printf("Parsed declaration expr\n");
+            return ParseDeclaration();
+
+        default:
+            printf("%s\n", IdentifierStr);
+            printf("%d\n", CurTok);
+            printf("%c\n", CurTok);
+            printf("unknown token\n");
+            exit(-1);
+    }
+
+    exit(-1);
+}
+
+static Exp *ParseTopLevelExpr()
+{
+    Exp *e = ParseExpression();
+    if (e != NULL)
+    {
+        struct exp_prototype *proto = malloc(sizeof(struct exp_prototype));
+        char *protoName = calloc(strlen(AnonExpr), sizeof(char));
+        strlcpy(protoName, AnonExpr, strlen(AnonExpr) * sizeof(char));
+        proto->name = protoName;
+        proto->numArgs = 0;
+        proto->args = NULL;
+
+
+        exp_body *body = malloc(sizeof(struct exp_body));
+        if (body == NULL)
+        {
+            printf("error allocating memory");
+            exit(-1);
+        }
+
+        Exp **exprs = calloc(1, sizeof(struct Exp *));
+        if (exprs == NULL)
+        {
+            printf("error allocating memory");
+            exit(-1);
+        }
+        exprs[0] = e;
+        body->exprs = exprs;
+        body->numExprs = 1;
+
+        Exp *function = EXP_NEW(exp_function, proto, body);
+        return function;
+    }
+
+    printf("ParseExpression returned null");
+
+    return NULL;
+}
+
+
+static void HandleTopLevelExpression()
+{
+    Exp *topLevel = ParseTopLevelExpr();
+    if (topLevel != NULL) 
+    {
+        Exp_print(topLevel);
+        Exp_Free(topLevel);
+    } else
+    {
+        getNextToken();
+    }
+}
+
+static void HandleDefinition()
+{
+    struct Exp *exp = ParseDefinition();
+    if (exp != NULL)
+    {
+        Exp_print(exp);
+        Exp_toIL(exp, 0);
+        Exp_Free(exp);
+        return;
+    }
+    getNextToken();
+}
+
+static void MainLoop()
+{
+    while (1)
+    {
+        switch(CurTok)
+        {
+            case tok_eof:
+                if (Depth > 0)
+                {
+                    printf("Expected }");
+                    exit(-1);
+                }
+                return;
+
+            case '{':
+                getNextToken();
+                break;
+
+            case '}':
+                getNextToken();
+                break;
+
+            case ';':
+                getNextToken();
+                break;
+
+            case tok_fn:
+                HandleDefinition();
+                break;
+
+            case tok_expose:
+                break;
+
+            default:
+                HandleTopLevelExpression();
+                break;
+        }
+    }
+}
+
+int main(int argc, char* argv[]) {
+    fptr = fopen(argv[1], "r");
+
+    if (fptr == NULL)
+    {
+        printf("file not found.");
+        exit(-1);
+    }
+
+    getNextToken();
+
+
+    setupGlobals();
+
+    MainLoop();
+
+    if (fptr != NULL)
+    {
+        fclose(fptr);
+    }
+
+    return 0;
+}
+
