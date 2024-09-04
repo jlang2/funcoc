@@ -21,8 +21,7 @@ export function l $itos(w %i) {
     %c =w add %c, 1
     jnz %cmp, @end, @loop
 @end
-    %z =w mul 8, %c
-    %s =l call $malloc(w %z)
+    %s =l call $malloc(w %c)
     %sb =l copy %s
 @revstring
     %v =w loadub %ca
