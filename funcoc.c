@@ -12,6 +12,8 @@ static int LastChar = ' ';
 static FILE *fptr = NULL;
 static char *AnonExpr = "__anon_expr";
 static int Depth = 0;
+static char **stringLiterals = {};
+static int curLit = 0;
 
 static char var = 'v';
 
@@ -28,7 +30,8 @@ enum Token {
     tok_equals = -8,
     tok_declaration = -9,
     tok_assignment = -10,
-    tok_binop = -11
+    tok_binop = -11,
+    tok_quo = -12
 };
 
 typedef struct VarRefKeyValue
@@ -41,15 +44,30 @@ typedef struct VarRefMap
 {
     struct VarRefKeyValue *map;
     size_t size;
+    size_t allocated;
 } VarRefMap;
 
-static struct VarRefMap varMap = { .map = NULL, .size = 0 };
+static struct VarRefMap varMap = { .map = NULL, .size = 0, .allocated = 0 };
 
-static char *VarRefMap_getValue(struct VarRefMap map, char *key)
+void VarRefMap_add(struct VarRefMap *map, struct VarRefKeyValue keyVal)
 {
-    for (int i = 0; i < map.size; i++)
+    if (map->allocated == 0)
     {
-        struct VarRefKeyValue chk = map.map[i];
+        struct VarRefKeyValue *temp = malloc(sizeof(struct VarRefKeyValue) * 8);
+        map->allocated = 8;
+        map->map = temp;
+    }
+    struct VarRefKeyValue *mod = map->map + map->size;
+    *mod = keyVal;
+    map->size++;
+}
+
+static char *VarRefMap_getValue(struct VarRefMap *map, char *key)
+{
+    struct VarRefKeyValue *iter = map->map;
+    for (int i = 0; i < map->size; i++)
+    {
+        struct VarRefKeyValue chk = *iter++;
         if (strcmp(chk.Key, key) == 0)
         {
             return chk.Val;
@@ -108,6 +126,13 @@ static char* appendStringAlloc(char *str, char character) {
     return newString;
 }
 
+static char nextChar()
+{
+    char c = getc(fptr);
+    LastChar = c;
+    return c;
+}
+
 static int gettok(FILE *fptr) {
 
     if (fptr == NULL)
@@ -118,6 +143,11 @@ static int gettok(FILE *fptr) {
 
     while (isspace(LastChar)) {
         LastChar = getc(fptr);
+    }
+
+    if (LastChar == '"')
+    {
+        return tok_quo;
     }
 
     if (LastChar == '=')
@@ -191,7 +221,17 @@ static int gettok(FILE *fptr) {
     return thisChar;
 }
 
+
 typedef struct exp_body { struct Exp **exprs; int numExprs; } exp_body;
+enum context 
+{
+    none,
+    reference,
+    assignment
+};
+
+enum context Context = none;
+
 typedef struct Exp Exp;
 struct Exp
 {
@@ -203,7 +243,8 @@ struct Exp
         exp_prototype,
         exp_function,
         exp_assignment,
-        exp_declaration
+        exp_declaration,
+        exp_stringlit
     } tag;
     union {
         struct exp_int { int val; } exp_int;
@@ -214,6 +255,7 @@ struct Exp
         struct exp_function { struct exp_prototype *proto; struct exp_body *body; } exp_function;
         struct exp_assignment { struct Exp *target; struct Exp *right; } exp_assignment;
         struct exp_declaration { char *type; char *name; } exp_declaration;
+        struct exp_stringlit { int literalId; } exp_stringlit;
     };
 };
 
@@ -358,7 +400,7 @@ char * Exp_prepare(Exp *exp)
 {
     if (exp->tag == exp_call)
     {
-        struct exp_call call = exp->exp_call;
+        struct exp_call call =  exp->exp_call;
         if (strcmp(call.callee, "toString") == 0)
         {
             char *varName = call.args[0]->exp_var.name;
@@ -374,9 +416,70 @@ char * Exp_prepare(Exp *exp)
 
             return finalVar;
         }
+    } else if(exp->tag == exp_var)
+    {
+        char *varName = exp->exp_var.name;
+        int len = strlen(varName) + 1;
+        char *finalVar = malloc(sizeof(char) * len);
+        strlcpy(finalVar, varName, len);
+        return finalVar;
     }
     return NULL;
 }
+
+char *Exp_getType(Exp *exp)
+{
+    if (exp->tag == exp_declaration)
+    {
+        return exp->exp_declaration.type;
+    }
+    if (exp->tag == exp_var)
+    {
+        char *type = VarRefMap_getValue(&varMap, exp->exp_var.name);
+        if (type == NULL)
+        {
+            printf("type not found");
+            exit(-1);
+        }
+        return type;
+    }
+    printf("type not found");
+    exit(-1);
+}
+
+char *getQbeType(char *type)
+{
+    if (strcmp(type, "int") == 0)
+    {
+        return "w";
+    } else if (strcmp(type, "string") == 0)
+    {
+        return "l";
+    } else
+    {
+        printf("type not implemented");
+        exit(-1);
+    }
+}
+
+void Exp_getLeftAssignment(Exp *exp)
+{
+    if (exp->tag == exp_declaration)
+    {
+        struct exp_declaration decl = exp->exp_declaration;
+        printPad("%%%s", decl.name);
+        return;
+    }
+    if (exp->tag == exp_var)
+    {
+        printPad("%%%s", exp->exp_var.name);
+        return;
+    }
+
+    printf("cannot assign");
+    exit(-1);
+}
+
 
 void Exp_toIL(Exp *exp)
 {
@@ -412,15 +515,22 @@ void Exp_toIL(Exp *exp)
 
     if (exp->tag == exp_assignment)
     {
+        Context = assignment;
         struct exp_assignment asign = exp->exp_assignment;
-        struct exp_declaration decl = asign.target->exp_declaration;
 
-        printPad("%%%s =w ", decl.name);
+        Exp_getLeftAssignment(asign.target);
+
+        char *type = Exp_getType(asign.target);
+        char *qbeType = getQbeType(type);
+        printf(" =%s ", qbeType);
+
         Exp_toIL(asign.right);
+        Context = none;
     }
 
     if (exp->tag == exp_call)
     {
+        Context = reference;
         struct exp_call call = exp->exp_call;
         if (strcmp(call.callee, "print") == 0)
         {
@@ -452,18 +562,15 @@ void Exp_toIL(Exp *exp)
             }
             free(vars);
         }
+        Context = none;
     }
 
     if (exp->tag == exp_var)
     {
-        char *vartype = VarRefMap_getValue(varMap, exp->exp_var.name);
-        if (strcmp(vartype, "int") == 0)
-        {
-            printPad("w %%%s", exp->exp_var.name);
-        } else
-        {
-            printPad("<unknown IL type> %s", exp->exp_var.name);
-        }
+        char *vartype = VarRefMap_getValue(&varMap, exp->exp_var.name);
+        char *qbetype = getQbeType(vartype);
+
+        printf("%s %%%s", qbetype, exp->exp_var.name);
     }
 
     if (exp->tag == exp_add)
@@ -472,6 +579,16 @@ void Exp_toIL(Exp *exp)
         int val1 = exp->exp_add.left->exp_int.val;
         int val2 = exp->exp_add.right->exp_int.val;
         printf("add %d, %d\n", val1, val2);
+    }
+
+    if (exp->tag == exp_stringlit)
+    {
+        if (Context == assignment)
+        {
+            printf("copy ");
+        }
+        struct exp_stringlit expLit = exp->exp_stringlit;
+        printf("$sl%d\n", expLit.literalId);
     }
 }
 
@@ -628,6 +745,60 @@ static int GetTokPrecedence()
 
 static Exp *ParsePrimary();
 
+static Exp *ParseStringLiteral()
+{
+    char next = nextChar(); // eat "
+
+    char *str = malloc(sizeof(char) * 1);
+    *str = '\0';
+
+    while (true)
+    {
+        char *temp = appendStringAlloc(str, next);
+        if (temp == NULL)
+        {
+            printf("error allocating memory");
+            exit(-1);
+        }
+        free(str);
+        str = temp;
+        next = nextChar();
+        if (next == '"')
+        {
+            break;
+        }
+        if (next == '\n')
+        {
+            break;
+        }
+    }
+    if (next == '\n')
+    {
+        printf("expected """);
+        exit(-1);
+    }
+    nextChar(); // eat "
+
+    if (curLit == 0)
+    {
+        char **tempAr = malloc(sizeof(char *) * 8);
+        if (tempAr == NULL)
+        {
+            printf("error allocating memory");
+            exit(-1);
+        }
+        stringLiterals = tempAr;
+    }
+
+    char **set = stringLiterals + curLit;
+    *set = str;
+    getNextToken(); // hopefully parse symbol ;
+
+    Exp *exp = EXP_NEW(exp_stringlit, curLit);
+    curLit++;
+    return exp;
+}
+
 static Exp *ParseBinOpRHS(int exprPrec, Exp *lhs)
 {
     while (1)
@@ -708,12 +879,16 @@ static Exp *ParseDeclaration()
         exit(-1);
     }
 
-    varMap.map = temp;
-    varMap.map[0] = (struct VarRefKeyValue) { .Key = varName, .Val = type };
-    varMap.size++;
+    struct VarRefKeyValue keyval = (struct VarRefKeyValue) { .Key = varName, .Val = type };
+    VarRefMap_add(&varMap, keyval);
 
     getNextToken(); // eat '='
     Exp *lhs = EXP_NEW(exp_declaration, type, varName);
+
+    if (CurTok == ';')
+    {
+        return lhs;
+    }
 
     getNextToken(); // advance to expression
     Exp *body = ParseExpression();
@@ -874,12 +1049,26 @@ static Exp *ParseIdentifierExpr()
     char *IdName = IdentifierStr;
     getNextToken();
 
-    if (CurTok != '(') // simple variable ref
+    if (CurTok != '(' && CurTok != tok_assignment) // simple variable ref
     {
         return EXP_NEW(exp_var, IdName);
     }
 
-    getNextToken();
+    if (CurTok == tok_assignment)
+    {
+        Exp *var_exp = EXP_NEW(exp_var, IdName);
+        getNextToken(); // eat =
+
+        Exp *right = ParseExpression();
+        if (right == NULL)
+        {
+            printf("expected expression");
+            exit(-1);
+        }
+        return EXP_NEW(exp_assignment, var_exp, right);
+    }
+
+    getNextToken(); // eat (
 
     Exp **args = malloc(sizeof(Exp *));
     size_t length = 0;
@@ -934,33 +1123,66 @@ static Exp *ParseIdentifierExpr()
 
 static Exp *ParsePrimary()
 {
-    switch (CurTok)
+    while (true)
     {
-        case '(':
-            return ParseParenExpr();
+        switch (CurTok)
+        {
+            case '(':
+                return ParseParenExpr();
 
-        case ';':
-            getNextToken();
-            return NULL;
+            case ';':
+                getNextToken();
+                return NULL;
 
-        case tok_int:
-            return ParseIntExpr();
+            case '\n':
+                getNextToken();
 
-        case tok_identifier:
-            return ParseIdentifierExpr();
+            case '\r':
+                getNextToken();
 
-        case tok_declaration:
-            return ParseDeclaration();
+            case tok_quo:
+                return ParseStringLiteral();
 
-        default:
-            printf("%s\n", IdentifierStr);
-            printf("%d\n", CurTok);
-            printf("%c\n", CurTok);
-            printf("unknown token\n");
-            exit(-1);
+            case tok_int:
+                return ParseIntExpr();
+
+            case tok_identifier:
+                return ParseIdentifierExpr();
+
+            case tok_declaration:
+                return ParseDeclaration();
+
+            default:
+                printf("%s\n", IdentifierStr);
+                printf("%d\n", CurTok);
+                printf("%c\n", CurTok);
+                printf("unknown token\n");
+                exit(-1);
+        }
     }
 
     exit(-1);
+}
+
+static Exp **Expressions = {};
+static int ExpCount = 0;
+
+static void ExpListAppend(Exp **list, Exp *exp)
+{
+    if (ExpCount == 0)
+    {
+        Exp **temp = malloc(sizeof(Exp *) * 8);
+        if (temp == NULL)
+        {
+            printf("error allocating memory");
+            exit(-1);
+        }
+        Expressions = temp;
+    }
+
+    Exp **set = Expressions + ExpCount;
+    ExpCount++;
+    *set = exp;
 }
 
 static Exp *ParseTopLevelExpr()
@@ -974,7 +1196,6 @@ static Exp *ParseTopLevelExpr()
         proto->name = protoName;
         proto->numArgs = 0;
         proto->args = NULL;
-
 
         exp_body *body = malloc(sizeof(struct exp_body));
         if (body == NULL)
@@ -1002,14 +1223,12 @@ static Exp *ParseTopLevelExpr()
     return NULL;
 }
 
-
 static void HandleTopLevelExpression()
 {
     Exp *topLevel = ParseTopLevelExpr();
     if (topLevel != NULL) 
     {
-        Exp_print(topLevel);
-        Exp_Free(topLevel);
+        ExpListAppend(Expressions, topLevel);
     } else
     {
         getNextToken();
@@ -1021,8 +1240,7 @@ static void HandleDefinition()
     struct Exp *exp = ParseDefinition();
     if (exp != NULL)
     {
-        Exp_toIL(exp);
-        Exp_Free(exp);
+        ExpListAppend(Expressions, exp);
         return;
     }
     getNextToken();
@@ -1080,6 +1298,18 @@ int main(int argc, char* argv[]) {
     getNextToken();
 
     MainLoop();
+
+    for (int i = 0; i < curLit; i++)
+    {
+        char *lit = *stringLiterals++;
+        printf("data $sl%d = { b \"%s\\0\" }\n", i, lit);
+    }
+
+    for (Exp *exp = *Expressions++; ExpCount > 0; ExpCount--)
+    {
+        Exp_toIL(exp);
+        Exp_Free(exp);
+    }
 
     if (fptr != NULL)
     {
